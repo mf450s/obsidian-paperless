@@ -1,9 +1,11 @@
-import { App, Editor, EditorRange, Modal, Notice, Plugin, PluginSettingTab, requestUrl, RequestUrlResponse, Setting } from 'obsidian';
+import { App, Editor, EditorRange, Modal, normalizePath, Notice, Plugin, PluginSettingTab, requestUrl, RequestUrlResponse, Setting, TFolder, TFile } from 'obsidian';
 import { escapeRegExp } from 'lodash';
 
 interface PluginSettings {
 	paperlessUrl: string;
 	paperlessAuthToken: string;
+	documentStoragePath: string;
+	embedDocuments: boolean;
 }
 
 interface PaperlessInsertionData {
@@ -13,7 +15,9 @@ interface PaperlessInsertionData {
 
 const DEFAULT_SETTINGS: PluginSettings = {
 	paperlessUrl: '',
-	paperlessAuthToken: ''
+	paperlessAuthToken: '',
+	documentStoragePath: '',
+	embedDocuments: true
 }
 
 export default class ObsidianPaperless extends Plugin {
@@ -36,7 +40,7 @@ export default class ObsidianPaperless extends Plugin {
 			editorCallback: (editor: Editor) => {
 				const paperlessUrl = searchPaperlessUrl(editor, this.settings);
 				if (paperlessUrl) {
-					createDocumentLink(editor, this.settings, paperlessUrl);
+					createDocument(this.app, editor, this.settings, paperlessUrl);
 				}
 			}
 		});
@@ -50,21 +54,21 @@ export default class ObsidianPaperless extends Plugin {
 			}
 		});
 
+		this.addCommand({
+			id: 'import-missing-paperless',
+			name: 'Import missing documents',
+			editorCallback: async (editor: Editor) => {
+				await importMissingDocuments(this.app, editor, this.settings);
+			}
+		});
+
 		this.addSettingTab(new SettingTab(this.app, this));
 	}
 
 	onunload() {}
 
 	async loadSettings() {
-		const savedSettings = await this.loadData();
-		this.settings = {
-			paperlessUrl: savedSettings?.paperlessUrl ?? DEFAULT_SETTINGS.paperlessUrl,
-			paperlessAuthToken: savedSettings?.paperlessAuthToken ?? DEFAULT_SETTINGS.paperlessAuthToken
-		};
-		// Drop settings used by the old PDF++ integration without creating any vault files.
-		if (savedSettings && ('documentStoragePath' in savedSettings || 'embedDocuments' in savedSettings)) {
-			await this.saveSettings();
-		}
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 	}
 
 	async saveSettings() {
@@ -211,8 +215,8 @@ function searchPaperlessUrl(editor: Editor, settings: PluginSettings): Paperless
 		}
 	}
 
-	// Also match legacy PDF++ dummy links so users can replace them with a direct share link.
-	const wikiLinkMatch = text.match(/!?\[\[paperless-(\d+)\.pdf\]\]/);
+	// also match [[paperless-{id}.pdf]] wiki links
+	const wikiLinkMatch = text.match(/\[\[paperless-(\d+)\.pdf\]\]/);
 	if (wikiLinkMatch) {
 		return {
 			documentId: wikiLinkMatch[1],
@@ -310,24 +314,93 @@ async function getShareLink(settings: PluginSettings, documentId: string) {
 		?? await createAndFindShareLink(settings, documentId, 'original');
 }
 
-export function formatPaperlessMarkdownLink(shareLink: URL): string {
-	return '[Paperless document](' + shareLink.href + ')';
+function getDocumentPath(settings: PluginSettings, documentId: string) {
+	const folderPath = normalizePath(settings.documentStoragePath).replace(/^\/+/, '');
+	const filename = 'paperless-' + documentId + '.pdf';
+	return folderPath ? folderPath + '/' + filename : filename;
 }
 
-async function createDocumentLink(editor: Editor, settings: PluginSettings, paperlessUrl: PaperlessInsertionData): Promise<boolean> {
+// Heavily inspired by https://github.com/RyotaUshio/obsidian-pdf-plus/blob/127ea5b94bb8f8fa0d4c66bcd77b3809caa50b21/src/modals/external-pdf-modals.ts#L249
+async function createDocument(app: App, editor: Editor, settings: PluginSettings, paperlessUrl: PaperlessInsertionData): Promise<boolean> {
 	try {
-		const shareLink = await getShareLink(settings, paperlessUrl.documentId);
-		if (!shareLink) {
-			throw new Error('No usable share link found');
+		// Create the parent folder
+		const folderPath = normalizePath(settings.documentStoragePath).replace(/^\/+/, '');
+		if (folderPath) {
+			const folderRef = app.vault.getAbstractFileByPath(folderPath);
+			const folderExists = !!(folderRef) && folderRef instanceof TFolder;
+			if (!folderExists) {
+				await app.vault.createFolder(folderPath);
+			}
 		}
 
-		editor.replaceRange(formatPaperlessMarkdownLink(shareLink), paperlessUrl.range.from, paperlessUrl.range.to);
+		const filename = 'paperless-' + paperlessUrl.documentId + '.pdf';
+		const documentPath = getDocumentPath(settings, paperlessUrl.documentId);
+		const fileRef = app.vault.getAbstractFileByPath(documentPath);
+		const fileExists = !!(fileRef) && fileRef instanceof TFile;
+		if (!fileExists) {
+			const shareLink = await getShareLink(settings, paperlessUrl.documentId);
+			if (!shareLink) {
+				throw new Error('No usable share link found');
+			}
+			await app.vault.create(documentPath, shareLink.href);
+		}
+
+		const linkPrefix = settings.embedDocuments ? '![' : '[';
+		editor.replaceRange(linkPrefix + '[' + filename + ']]', paperlessUrl.range.from, paperlessUrl.range.to);
 		return true;
 	} catch (error) {
-		console.error('Failed to create Paperless link:', error);
-		new Notice('Failed to link Paperless document.');
+		console.error('Failed to create Paperless document:', error);
+		new Notice('Failed to import Paperless document.');
 		return false;
 	}
+}
+
+async function importMissingDocuments(app: App, editor: Editor, settings: PluginSettings) {
+	const content = editor.getValue();
+	const pattern = /!?\[\[paperless-(\d+)\.pdf\]\]/g;
+	const documentIds = new Set<string>();
+	let match;
+	while ((match = pattern.exec(content)) !== null) {
+		documentIds.add(match[1]);
+	}
+
+	if (documentIds.size === 0) {
+		new Notice('No paperless document links found in this note.');
+		return;
+	}
+
+	// Create the parent folder
+	const folderPath = normalizePath(settings.documentStoragePath).replace(/^\/+/, '');
+	if (folderPath) {
+		const folderRef = app.vault.getAbstractFileByPath(folderPath);
+		const folderExists = !!(folderRef) && folderRef instanceof TFolder;
+		if (!folderExists) {
+			await app.vault.createFolder(folderPath);
+		}
+	}
+
+	let importedCount = 0;
+	let failedCount = 0;
+	for (const documentId of documentIds) {
+		try {
+			const documentPath = getDocumentPath(settings, documentId);
+			const fileRef = app.vault.getAbstractFileByPath(documentPath);
+			const fileExists = !!(fileRef) && fileRef instanceof TFile;
+			if (!fileExists) {
+				const shareLink = await getShareLink(settings, documentId);
+				if (!shareLink) {
+					throw new Error('No usable share link found');
+				}
+				await app.vault.create(documentPath, shareLink.href);
+				importedCount++;
+			}
+		} catch (error) {
+			failedCount++;
+			console.error('Failed to import Paperless document ' + documentId + ':', error);
+		}
+	}
+
+	new Notice(`Imported ${importedCount} of ${documentIds.size} document(s).${failedCount ? ` Failed: ${failedCount}.` : ''}`);
 }
 
 async function searchPaperlessDocuments(settings: PluginSettings, searchQuery: string, tagIds: number[] = []): Promise<string[]> {
@@ -652,7 +725,7 @@ class DocumentSelectorModal extends Modal {
 						to: { line: cursor.line, ch: cursor.ch }
 					}
 				}
-				const created = await createDocumentLink(this.editor, this.settings, documentInfo);
+				const created = await createDocument(this.app, this.editor, this.settings, documentInfo);
 				if (created) {
 					this.close();
 				}
@@ -723,6 +796,24 @@ class SettingTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 				})
 				.inputEl.type = 'password');
+		new Setting(containerEl)
+			.setName('Document storage path')
+			.setDesc('Location for stored documents.')
+			.addText(text => text
+				.setValue(this.plugin.settings.documentStoragePath)
+				.onChange(async (value) => {
+					this.plugin.settings.documentStoragePath = value;
+					await this.plugin.saveSettings();
+				}));
+		new Setting(containerEl)
+			.setName('Embed documents')
+			.setDesc('When enabled, new documents are inserted as embedded PDFs (![[...]]). Otherwise as links ([[...]]).')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.embedDocuments)
+				.onChange(async (value) => {
+					this.plugin.settings.embedDocuments = value;
+					await this.plugin.saveSettings();
+				}));
 		new Setting(containerEl)
 			.setName('Test connection')
 			.setDesc('Validate the connection between obsidian and your paperless instance.')
