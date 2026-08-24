@@ -13,7 +13,7 @@ interface PaperlessInsertionData {
 
 const DEFAULT_SETTINGS: PluginSettings = {
 	paperlessUrl: '',
- 	paperlessAuthToken: ''
+	paperlessAuthToken: ''
 }
 
 export default class ObsidianPaperless extends Plugin {
